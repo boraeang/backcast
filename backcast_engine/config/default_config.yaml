@@ -1,0 +1,52 @@
+random_seed: 42
+
+data:
+  date_column: "date"
+  min_overlap_days: 504
+
+em:
+  max_iterations: 500
+  tolerance: 1.0e-8
+  track_loglikelihood: true
+
+kalman:
+  state_noise_scale: 0.01
+  initial_state_cov_scale: 1.0
+  use_smoother: true
+  backcast_beta_method: "earliest_smoothed"
+  backcast_beta_k: 63
+
+hmm:
+  n_regimes_candidates: [2, 3, 4]
+  selection_criterion: "bic"
+  max_iterations: 200
+  tolerance: 1.0e-4
+
+imputation:
+  n_imputations: 50
+  method: "unconditional_em"   # "unconditional_em" | "regime_conditional" | "auto"
+
+model_selection:
+  enabled: false
+  candidates: ["unconditional_em", "regime_conditional"]
+  criterion: "combined"        # "rmse" | "coverage" | "combined"
+  hmm_n_regimes: 2
+
+validation:
+  holdout_days: 504
+  n_windows: 3
+  coverage_level: 0.95
+
+downstream:
+  covariance_shrinkage: true
+  denoise_eigenvalues: true
+  uncertainty_confidence: 0.95
+  backtest_strategies: ["equal_weight", "inverse_volatility", "min_variance", "risk_parity"]
+  backtest_lookback: 63
+  backtest_rebalance_freq: 21
+
+output:
+  save_plots: true
+  plot_format: "png"
+  plot_dpi: 120
+  save_imputations: false

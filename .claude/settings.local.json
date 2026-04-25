@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:files.pythonhosted.org)",
+      "Bash(PYTHONPATH=src python -m pytest tests/ -v)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_tier3.py -v)",
+      "Bash(PYTHONPATH=src python -m pytest tests/)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_tier4.py tests/test_cli.py -v)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_tier4.py::TestNearSingular -v)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_tier4.py tests/test_cli.py)",
+      "Bash(python -m synthgen --tier 4 --scenario all --output __TRACKED_VAR__/synthgen_smoke --t-total 3500 --short-start-day 2500 --log-level WARNING)",
+      "Bash(PYTHONPATH=src python -m synthgen --tier 1 --output ./output/tier1 --log-level WARNING)",
+      "Bash(PYTHONPATH=src python -m synthgen --tier 2 --output ./output/tier2 --log-level WARNING)",
+      "Bash(PYTHONPATH=src python -m synthgen --tier 2 --adversarial --output ./output/tier2_adversarial --log-level WARNING)",
+      "Bash(PYTHONPATH=src python -m synthgen --tier 3 --output ./output/tier3 --log-level WARNING)",
+      "Bash(PYTHONPATH=src python -m synthgen --tier 4 --scenario all --output ./output/tier4 --log-level WARNING)",
+      "Bash(PYTHONPATH=/Users/claude/backcast/backcast_engine/src python -c \"from backcast import em_stambaugh, single_impute, load_backcast_dataset; print\\('imports OK'\\)\")",
+      "Bash(PYTHONPATH=src python -c \"from backcast import em_stambaugh, single_impute, load_backcast_dataset; print\\('imports OK'\\)\")",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_metrics.py tests/test_diagnostics.py tests/test_holdout.py -v)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_regime_hmm.py tests/test_kalman_tvp.py -v)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_regime_hmm.py tests/test_kalman_tvp.py)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_multiple_impute.py tests/test_copula_sim.py -v)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_copula_sim.py -v)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_copula_sim.py tests/test_multiple_impute.py)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_downstream.py tests/test_plots.py tests/test_pipeline.py -v)",
+      "Bash(python scripts/build_notebooks.py)",
+      "Bash(python -c ' *)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_plots.py tests/test_pipeline.py)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_run_backcast_cli.py -v)",
+      "Bash(PYTHONPATH=src python -m pytest tests/test_model_selector.py tests/test_pipeline.py -v)",
+      "Bash(PYTHONPATH=src python -m pytest tests/ --collect-only -q)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true
+  }
+}

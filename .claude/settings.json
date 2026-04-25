@@ -1,0 +1,22 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "filesystem": {
+      "denyRead": [
+        "~/Documents",
+        "~/Desktop",
+        "~/Downloads",
+        "~/Dropbox",
+        "~/Library",
+        "~/.ssh",
+        "~/.gnupg",
+        "~/.aws",
+        "~/.config",
+        "~/Google Drive",
+	"~"
+      ],
+      "allowRead": ["."],
+      "allowWrite": []
+    }
+  }
+}
