@@ -29,7 +29,16 @@
       "Bash(PYTHONPATH=src python -m pytest tests/test_plots.py tests/test_pipeline.py)",
       "Bash(PYTHONPATH=src python -m pytest tests/test_run_backcast_cli.py -v)",
       "Bash(PYTHONPATH=src python -m pytest tests/test_model_selector.py tests/test_pipeline.py -v)",
-      "Bash(PYTHONPATH=src python -m pytest tests/ --collect-only -q)"
+      "Bash(PYTHONPATH=src python -m pytest tests/ --collect-only -q)",
+      "Bash(PYTHONPATH=src python /tmp/test_s12.py)",
+      "Bash(/Users/bora.eang/Library/Jupyter/kernels/paf-venv/kernel.json)",
+      "Read(//Users/bora.eang/Library/Jupyter/kernels/paf-venv/**)",
+      "Bash(/Users/claude/upsampler/.venv/bin/python --version)",
+      "Bash(/Users/claude/upsampler/.venv/bin/python -c \"import backcast\")",
+      "Bash(/Users/claude/upsampler/.venv/bin/pip install *)",
+      "Bash(/Users/claude/upsampler/.venv/bin/python -c \"import backcast; print\\('backcast importable OK'\\)\")",
+      "Bash(/Users/claude/upsampler/.venv/bin/python -c \"import backcast; print\\('OK'\\)\")",
+      "Bash(jupyter nbconvert *)"
     ]
   },
   "sandbox": {
