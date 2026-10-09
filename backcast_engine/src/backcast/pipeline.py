@@ -288,6 +288,7 @@ class BackcastPipeline:
                 tolerance=float(hcfg.get("tolerance", 1e-4)),
                 min_covar=float(hcfg.get("min_covar", 1e-3)),
                 reject_underfilled_states=bool(hcfg.get("reject_underfilled_states", True)),
+                reject_nonconverged=bool(hcfg.get("reject_nonconverged", True)),
                 fallback_to_single_regime=bool(hcfg.get("fallback_to_single_regime", True)),
                 overlap_mask=overlap_mask,
                 seed=self.seed,
@@ -387,6 +388,7 @@ class BackcastPipeline:
                 shrinkage=icfg.get("regime_shrinkage", "auto"),
                 fallback_to_pooled=bool(icfg.get("regime_fallback_to_pooled", True)),
                 psd_epsilon=float(icfg.get("psd_epsilon", 1e-10)),
+                shrink_mean=bool(icfg.get("regime_shrink_mean", True)),
             )
             return multiple_impute_regime(
                 dataset, hmm.regime_labels, regime_params,

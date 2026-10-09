@@ -13,7 +13,7 @@ short-history assets and ``τ = reliable_threshold`` (default
 condition              source      parameters
 =====================  ==========  =============================================
 ``n_k >= τ``           ``full``    regime's own ``(μ_k, Σ_k)``
-``N_short < n_k < τ``  ``shrunk``  ``λ·(μ, Σ)_pooled + (1−λ)·(μ_k, Σ_k)``
+``N_short < n_k < τ``  ``shrunk``  ``λ·Σ_pooled + (1−λ)·Σ_k`` (and same for μ)
 ``n_k <= N_short``     ``pooled``  unconditional ``(μ, Σ)`` from all overlap rows
 =====================  ==========  =============================================
 
@@ -21,6 +21,10 @@ with ``λ = τ / (τ + n_k)`` for a fixed rule, or the Ledoit-Wolf intensity
 toward the pooled target when ``shrinkage="auto"``.  Shrinkage is applied to
 the **joint** covariance (not only the conditional block) so that both
 ``β = Σ₂₁Σ₁₁⁻¹`` and ``Σ₂|₁`` are well defined even when ``n_k <= N_long``.
+The mean is shrunk with the same ``λ`` by default (``shrink_mean=True``): a
+regime mean estimated from a handful of observations otherwise adds a large
+constant bias to every backcast date in that regime.  Set
+``shrink_mean=False`` to keep the raw ``μ_k`` (covariance-only shrinkage).
 Every covariance passes through :func:`nearest_psd` before any Cholesky.
 """
 from __future__ import annotations
@@ -152,6 +156,7 @@ def build_regime_params(
     shrinkage: Union[str, float, None] = "auto",
     fallback_to_pooled: bool = True,
     psd_epsilon: float = 1e-10,
+    shrink_mean: bool = True,
 ) -> dict[int, RegimeParams]:
     """Build usable parameters for every regime via the full/shrunk/pooled cascade.
 
@@ -180,6 +185,9 @@ def build_regime_params(
         pooled.
     psd_epsilon : float
         Eigenvalue floor applied by :func:`nearest_psd` at every level.
+    shrink_mean : bool
+        Shrink the regime mean toward the pooled mean with the same ``λ`` as
+        the covariance (``shrunk`` tier only).  False keeps the raw ``μ_k``.
 
     Returns
     -------
@@ -251,7 +259,7 @@ def build_regime_params(
                 mu, sigma = mu_raw, sigma_raw
             else:
                 lam = _shrinkage_intensity(block, sigma_raw, sigma_pooled, n_k, tau, shrinkage)
-                mu = lam * mu_pooled + (1.0 - lam) * mu_raw
+                mu = lam * mu_pooled + (1.0 - lam) * mu_raw if shrink_mean else mu_raw
                 sigma = lam * sigma_pooled + (1.0 - lam) * sigma_raw
                 logger.info(
                     "Regime %d: %d overlap observations (< %d) — shrunk toward "

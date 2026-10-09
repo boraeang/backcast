@@ -181,10 +181,13 @@ class TestConfigCompat:
         assert icfg["regime_shrinkage"] == "auto"
         assert icfg["regime_fallback_to_pooled"] is True
         assert icfg["psd_epsilon"] == pytest.approx(1e-10)
+        assert icfg["regime_shrink_mean"] is True
+        assert icfg["method"] == "unconditional_em"
         hcfg = pipe.config["hmm"]
         assert hcfg["min_covar"] == pytest.approx(1e-3)
         assert hcfg["reject_underfilled_states"] is True
         assert hcfg["fallback_to_single_regime"] is True
+        assert hcfg["reject_nonconverged"] is True
 
     def test_legacy_min_obs_mapped_with_deprecation(self, caplog):
         raw = {"imputation": {"method": "regime_conditional", "min_obs_per_regime": 15}}
