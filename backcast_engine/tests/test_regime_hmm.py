@@ -15,7 +15,10 @@ import pytest
 from backcast.data.loader import build_backcast_dataset, load_backcast_dataset
 from backcast.imputation.single_impute import impute_missing_values, single_impute
 from backcast.models.em_stambaugh import em_stambaugh
+import backcast.models.regime_hmm as regime_hmm_mod
+from backcast.exceptions import BackcastConvergenceError
 from backcast.models.regime_hmm import (
+    _fit_hmm_candidate,
     compute_regime_params,
     fit_and_select_hmm,
     fit_regime_hmm,
@@ -112,6 +115,121 @@ class TestModelSelection:
         assert sel.best_n_regimes in (2, 3)
 
 
+def _assert_finite_model(res) -> None:
+    for arr in (res.means, res.covariances, res.transition_matrix, res.initial_probs):
+        assert np.isfinite(arr).all()
+    assert np.isfinite(res.log_likelihood)
+
+
+class TestDegenerateRejection:
+    """Part 1 of the regime-NaN fix: degenerate K is rejected, never returned."""
+
+    def test_rejects_overparameterised_k(self):
+        """Data supporting only 2 regimes, candidates [2..5] → K≤2, finite."""
+        X, _, _, _, _ = _simulate_2regime(T=1500, seed=11)
+        df = pd.DataFrame(X, columns=list("ABC"))
+        sel = fit_and_select_hmm(
+            df, n_regimes_candidates=(2, 3, 4, 5), criterion="bic",
+            n_short=10, seed=0,
+        )
+        assert sel.best_n_regimes <= 2
+        _assert_finite_model(sel.best)
+        assert sel.best_n_regimes in sel.surviving_candidates
+        for k, score in sel.scores.items():
+            if k not in sel.surviving_candidates:
+                assert score == float("inf")
+        assert (sel.state_occupancy >= 11).all()
+
+    def test_nan_fit_is_rejected(self, monkeypatch):
+        X, _, _, _, _ = _simulate_2regime(T=800, seed=12)
+        real_fit = regime_hmm_mod.fit_regime_hmm
+
+        def nan_fit(*args, **kwargs):
+            res = real_fit(*args, **kwargs)
+            res.means = res.means.copy()
+            res.means[0, 0] = np.nan
+            return res
+
+        monkeypatch.setattr(regime_hmm_mod, "fit_regime_hmm", nan_fit)
+        model, bic = _fit_hmm_candidate(X, 2, 1, 1e-3, 200, np.random.default_rng(0))
+        assert model is None and bic == float("inf")
+
+    def test_inf_covariance_is_rejected(self, monkeypatch):
+        X, _, _, _, _ = _simulate_2regime(T=800, seed=12)
+        real_fit = regime_hmm_mod.fit_regime_hmm
+
+        def inf_fit(*args, **kwargs):
+            res = real_fit(*args, **kwargs)
+            res.covariances = res.covariances.copy()
+            res.covariances[1, 0, 0] = np.inf
+            return res
+
+        monkeypatch.setattr(regime_hmm_mod, "fit_regime_hmm", inf_fit)
+        model, bic = _fit_hmm_candidate(X, 2, 1, 1e-3, 200, np.random.default_rng(0))
+        assert model is None and bic == float("inf")
+
+    def test_raising_fit_is_rejected(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise np.linalg.LinAlgError("Matrix is not positive definite")
+
+        monkeypatch.setattr(regime_hmm_mod, "fit_regime_hmm", boom)
+        X = np.random.default_rng(0).standard_normal((200, 2))
+        model, bic = _fit_hmm_candidate(X, 2, 1, 1e-3, 50, np.random.default_rng(0))
+        assert model is None and bic == float("inf")
+
+    def test_non_converged_fit_is_rejected(self):
+        X, _, _, _, _ = _simulate_2regime(T=1000, seed=13)
+        model, bic = _fit_hmm_candidate(
+            X, 2, 1, 1e-3, 2, np.random.default_rng(0), tolerance=1e-12,
+        )
+        assert model is None and bic == float("inf")
+
+    def test_fallback_to_single_regime(self, caplog):
+        X, _, _, _, _ = _simulate_2regime(T=600, seed=14)
+        df = pd.DataFrame(X, columns=list("ABC"))
+        # n_short larger than T → every K≥2 state is under-filled
+        with caplog.at_level("WARNING", logger="backcast.models.regime_hmm"):
+            sel = fit_and_select_hmm(
+                df, n_regimes_candidates=(2, 3), n_short=len(df), seed=0,
+            )
+        assert sel.fell_back_to_single_regime
+        assert sel.best_n_regimes == 1
+        assert sel.surviving_candidates == []
+        assert (sel.best.regime_labels == 0).all()
+        _assert_finite_model(sel.best)
+        np.testing.assert_allclose(sel.best.means[0], X.mean(axis=0), atol=1e-10)
+        assert any("falling back to K=1" in r.message for r in caplog.records)
+
+    def test_fallback_disabled_raises(self):
+        X, _, _, _, _ = _simulate_2regime(T=600, seed=14)
+        with pytest.raises(BackcastConvergenceError):
+            fit_and_select_hmm(
+                X, n_regimes_candidates=(2,), n_short=len(X),
+                fallback_to_single_regime=False, seed=0,
+            )
+
+    def test_overlap_occupancy_reported(self):
+        X, _, _, _, _ = _simulate_2regime(T=2000, seed=15)
+        mask = np.zeros(len(X), dtype=bool)
+        mask[-700:] = True
+        sel = fit_and_select_hmm(
+            X, n_regimes_candidates=(2,), n_short=2, overlap_mask=mask, seed=0,
+        )
+        assert sel.overlap_occupancy is not None
+        assert sel.overlap_occupancy.sum() == 700
+        assert sel.state_occupancy.sum() == len(X)
+        assert len(sel.overlap_occupancy) == sel.best_n_regimes
+
+    def test_min_covar_floor_keeps_regimes_separable(self):
+        """The floor is relative to per-asset variance, so it must not wash
+        out the calm/crisis split on daily-return-scale data."""
+        X, true_labels, _, _, _ = _simulate_2regime(T=3000, seed=0)
+        res = fit_regime_hmm(X, n_regimes=2, min_covar=1e-3, seed=0)
+        assert (res.regime_labels == true_labels).mean() > 0.90
+        ratio = np.trace(res.covariances[1]) / np.trace(res.covariances[0])
+        assert ratio > 4.0   # true ratio is 9
+
+
 class TestRegimeParams:
     def test_regime_params_on_known_data(self):
         X, labels, _, (mu_calm, mu_crisis), _ = _simulate_2regime(T=3000, seed=8)
@@ -120,15 +238,17 @@ class TestRegimeParams:
         # Calm regime mean
         np.testing.assert_allclose(params[0]["mu"], mu_calm, atol=1e-3)
 
-    def test_drops_tiny_regimes(self):
+    def test_tiny_regime_is_pooled_not_dropped(self, caplog):
         X, labels, _, _, _ = _simulate_2regime(T=1000, seed=9)
-        # Create a label that has too few obs
         labels = labels.copy()
         labels[:] = 0
-        labels[:5] = 2   # only 5 obs for regime 2
+        labels[:3] = 2   # only 3 obs for regime 2 (<= N=3 columns)
         df = pd.DataFrame(X, columns=list("ABC"))
-        params = compute_regime_params(df, labels, min_obs_per_regime=30)
-        assert 2 not in params
+        with caplog.at_level("WARNING"):
+            params = compute_regime_params(df, labels, min_obs_per_regime=30)
+        assert params[2]["source"] == "pooled"
+        np.testing.assert_allclose(params[2]["mu"], X.mean(axis=0))
+        assert any("DEPRECATION" in r.message for r in caplog.records)
 
     def test_nan_input_rejected(self):
         rng = np.random.default_rng(0)

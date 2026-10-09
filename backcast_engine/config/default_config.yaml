@@ -21,10 +21,19 @@ hmm:
   selection_criterion: "bic"
   max_iterations: 200
   tolerance: 1.0e-4
+  min_covar: 1.0e-3                 # covariance floor, relative to per-asset variance (raise if states collapse)
+  reject_underfilled_states: true   # drop K if any state has < n_short+1 Viterbi obs
+  fallback_to_single_regime: true   # if no K survives, use K=1 (unconditional)
 
 imputation:
   n_imputations: 50
   method: "unconditional_em"   # "unconditional_em" | "regime_conditional" | "auto"
+  # Regime-conditional parameter cascade (full / shrunk / pooled).
+  # REMOVED: min_obs_per_regime (old configs are mapped to regime_reliable_threshold with a warning)
+  regime_reliable_threshold: null   # overlap obs for "full"; null -> max(3 * n_short, 60)
+  regime_shrinkage: "auto"          # "auto" (Ledoit-Wolf toward pooled), "heuristic" (tau/(tau+n_k)), or float in [0,1]
+  regime_fallback_to_pooled: true   # regimes with n_k <= n_short use pooled params (false -> raise)
+  psd_epsilon: 1.0e-10              # eigenvalue floor before every Cholesky
 
 model_selection:
   enabled: false

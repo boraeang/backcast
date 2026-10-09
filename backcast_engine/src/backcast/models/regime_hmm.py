@@ -7,7 +7,11 @@ standard Baum-Welch update; regime identifiability is fixed by sorting the
 estimated regimes by total volatility (``tr Σ_k``) so regime 0 is always
 "calm" and regime ``K-1`` is always the highest-vol regime.
 
-Model selection (K ∈ {2, 3, 4}) uses BIC by default.
+Model selection (K ∈ {2, 3, 4}) uses BIC by default.  Degenerate candidate
+fits (NaN/inf parameters, non-convergence, numerical failure, or a state with
+too few Viterbi observations to estimate the short-asset covariance) are
+rejected during selection; if no candidate survives, the selector falls back to
+a single-regime (unconditional) model rather than returning a NaN model.
 
 References
 ----------
@@ -27,9 +31,9 @@ import pandas as pd
 from scipy.linalg import solve_triangular
 from scipy.special import logsumexp
 
-# NOTE: `_fill_rows_conditional` is imported lazily inside
-# `regime_conditional_impute` to avoid a circular import
-# (backcast.models.__init__ → regime_hmm → imputation.single_impute →
+# NOTE: imputation helpers are imported lazily inside
+# `compute_regime_params` / `regime_conditional_impute` to avoid a circular
+# import (backcast.models.__init__ → regime_hmm → imputation.single_impute →
 #  models.em_stambaugh → back into models.__init__).
 
 logger = logging.getLogger(__name__)
@@ -91,6 +95,16 @@ class HMMSelectionResult:
     best : HMMResult
     criterion : str
     scores : dict[int, float]
+        Selection score per candidate; ``+inf`` for rejected candidates.
+    surviving_candidates : list[int]
+        Candidates whose fit passed every degeneracy check.
+    state_occupancy : np.ndarray, shape (K_best,)
+        Viterbi state counts of the chosen model over the full sample.
+    overlap_occupancy : np.ndarray or None, shape (K_best,)
+        Viterbi state counts of the chosen model restricted to the overlap
+        rows (``None`` when no overlap mask was supplied).
+    fell_back_to_single_regime : bool
+        ``True`` if no candidate survived and the K=1 model was used.
     """
 
     candidates: list[int]
@@ -99,6 +113,10 @@ class HMMSelectionResult:
     best: HMMResult
     criterion: str
     scores: dict
+    surviving_candidates: list[int] = field(default_factory=list)
+    state_occupancy: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    overlap_occupancy: Optional[np.ndarray] = None
+    fell_back_to_single_regime: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +237,34 @@ def _canonicalise(
     return pi, A, means, covs, posterior, labels
 
 
+def _floor_covariance(cov: np.ndarray, scale: np.ndarray, min_covar: float) -> np.ndarray:
+    """Clip eigenvalues of ``cov`` at ``min_covar`` in standardised units.
+
+    Parameters
+    ----------
+    cov : np.ndarray, shape (N, N)
+        State covariance from the M-step.
+    scale : np.ndarray, shape (N,)
+        Per-asset sample standard deviations.
+    min_covar : float
+        Eigenvalue floor for the standardised covariance.
+
+    Returns
+    -------
+    np.ndarray, shape (N, N)
+        ``cov`` unchanged if already above the floor, else the floored matrix.
+    """
+    if min_covar <= 0:
+        return cov
+    z = cov / np.outer(scale, scale)
+    z = 0.5 * (z + z.T)
+    vals, vecs = np.linalg.eigh(z)
+    if vals.min() >= min_covar:
+        return cov
+    z = (vecs * np.clip(vals, min_covar, None)) @ vecs.T
+    return z * np.outer(scale, scale)
+
+
 # ---------------------------------------------------------------------------
 # Public fit routines
 # ---------------------------------------------------------------------------
@@ -230,7 +276,8 @@ def fit_regime_hmm(
     max_iter: int = 200,
     tolerance: float = 1e-4,
     cov_regularization: float = 1e-10,
-    seed: int = 0,
+    min_covar: float = 1e-3,
+    seed: "int | npr.Generator" = 0,
 ) -> HMMResult:
     """Fit a Gaussian HMM via log-space Baum-Welch.
 
@@ -243,9 +290,19 @@ def fit_regime_hmm(
     tolerance : float
         Absolute convergence threshold on the log-likelihood.
     cov_regularization : float
-        Value added to the diagonal of each M-step covariance update for
-        numerical stability.
-    seed : int
+        Absolute value added to the diagonal of each M-step covariance update
+        for numerical stability.
+    min_covar : float
+        Relative covariance floor.  After each M-step, every state covariance
+        is expressed in variance-standardised coordinates
+        ``D^{-1/2} Σ_k D^{-1/2}`` (``D = diag(Var(X))``) and its eigenvalues
+        are clipped below at *min_covar*.  Being relative, it is meaningful on
+        daily-return scales (variances ~1e-4, where an absolute 1e-3 floor
+        would swamp the data); being a clip rather than an additive term, it
+        leaves healthy states at their exact MLE and only lifts collapsing
+        ones.  Raise it if states keep collapsing.
+    seed : int or np.random.Generator
+        Seed (or an existing generator) for the initialisation draw.
 
     Returns
     -------
@@ -266,6 +323,8 @@ def fit_regime_hmm(
         raise ValueError("fit_regime_hmm requires a fully-observed X (no NaN)")
     T, N = X_arr.shape
     rng = npr.default_rng(seed)
+    scale = np.sqrt(np.atleast_1d(np.var(X_arr, axis=0, ddof=1)))
+    scale = np.where(scale > 0, scale, 1.0)
 
     pi, A, means, covs = _initial_params(X_arr, n_regimes, rng)
     ll_trace: list[float] = []
@@ -313,6 +372,7 @@ def fit_regime_hmm(
                 .sum(axis=0)
                 / total_safe[k]
             )
+            covs_new[k] = _floor_covariance(covs_new[k], scale, min_covar)
             covs_new[k] += cov_regularization * np.eye(N)
 
         # Convergence check (increase in log-likelihood)
@@ -359,31 +419,216 @@ def fit_regime_hmm(
     )
 
 
+def _degeneracy_reason(res: HMMResult, n_short: int) -> Optional[str]:
+    """Return why a fitted HMM is unusable, or ``None`` if it is usable."""
+    if not res.converged:
+        return f"did not converge in {res.n_iter} iterations"
+    for name, arr in (("means", res.means), ("covariances", res.covariances),
+                      ("transition_matrix", res.transition_matrix)):
+        if np.isnan(arr).any():
+            return f"NaN in {name}"
+        if np.isinf(arr).any():
+            return f"inf in {name}"
+    if not np.isfinite(res.log_likelihood):
+        return "non-finite log-likelihood"
+    counts = np.bincount(res.regime_labels, minlength=res.n_regimes)
+    if (counts < n_short + 1).any():
+        return (
+            f"under-filled state (Viterbi counts {counts.tolist()}, "
+            f"need >= {n_short + 1} per state)"
+        )
+    return None
+
+
+def _fit_hmm_candidate(
+    X: "np.ndarray | pd.DataFrame",
+    k: int,
+    n_short: int,
+    min_covar: float,
+    n_iter: int,
+    rng: npr.Generator,
+    *,
+    tolerance: float = 1e-4,
+    reject_underfilled_states: bool = True,
+) -> tuple[Optional[HMMResult], float]:
+    """Fit a K-state Gaussian HMM; return ``(model, bic)`` or ``(None, inf)``.
+
+    A candidate is rejected (``(None, inf)``) if the fit raises, does not
+    converge, has NaN/inf parameters or log-likelihood, or — when
+    *reject_underfilled_states* — any Viterbi state has fewer than
+    ``n_short + 1`` observations (its covariance on the short-asset block
+    would not be estimable).
+
+    Parameters
+    ----------
+    X : np.ndarray or pd.DataFrame, shape (T, N)
+        Fully observed long-history returns.
+    k : int
+        Number of hidden states.
+    n_short : int
+        Number of short-history assets.
+    min_covar : float
+        Relative covariance floor (see :func:`fit_regime_hmm`).
+    n_iter : int
+        Maximum Baum-Welch iterations.
+    rng : np.random.Generator
+        Generator for the initialisation draw.
+    tolerance : float
+        Log-likelihood convergence threshold.
+    reject_underfilled_states : bool
+        Apply the ``n_short + 1`` occupancy check.
+
+    Returns
+    -------
+    tuple[HMMResult or None, float]
+        The fitted model and its BIC, or ``(None, inf)`` if degenerate.
+    """
+    try:
+        res = fit_regime_hmm(
+            X, n_regimes=k, max_iter=n_iter, tolerance=tolerance,
+            min_covar=min_covar, seed=rng,
+        )
+    except (np.linalg.LinAlgError, ValueError, FloatingPointError) as exc:
+        logger.warning("HMM K=%d rejected: fit raised %s: %s",
+                       k, type(exc).__name__, exc)
+        return None, float("inf")
+    reason = _degeneracy_reason(res, n_short if reject_underfilled_states else -1)
+    if reason is not None:
+        logger.warning("HMM K=%d rejected: %s", k, reason)
+        return None, float("inf")
+    return res, res.bic
+
+
 def fit_and_select_hmm(
-    X,
+    X: "np.ndarray | pd.DataFrame",
     n_regimes_candidates: tuple[int, ...] = (2, 3, 4),
     criterion: str = "bic",
-    **fit_kwargs,
+    *,
+    n_short: int = 0,
+    max_iter: int = 200,
+    tolerance: float = 1e-4,
+    min_covar: float = 1e-3,
+    reject_underfilled_states: bool = True,
+    fallback_to_single_regime: bool = True,
+    overlap_mask: Optional[np.ndarray] = None,
+    seed: int = 0,
 ) -> HMMSelectionResult:
-    """Fit HMMs for each candidate K, return best by BIC (default) or AIC."""
+    """Fit HMMs for each candidate K and select the best non-degenerate one.
+
+    Each candidate is fitted by :func:`_fit_hmm_candidate`; degenerate fits
+    score ``+inf`` and so lose selection.  If no candidate survives and
+    *fallback_to_single_regime* is set, a K=1 (unconditional) model is used
+    and a WARNING is logged.
+
+    Parameters
+    ----------
+    X : np.ndarray or pd.DataFrame, shape (T, N)
+        Fully observed long-history returns.
+    n_regimes_candidates : tuple[int, ...]
+        Candidate numbers of states.
+    criterion : {"bic", "aic"}
+        Selection criterion (lower is better).
+    n_short : int
+        Number of short-history assets; drives the occupancy check.
+    max_iter : int
+        Maximum Baum-Welch iterations per candidate.
+    tolerance : float
+        Log-likelihood convergence threshold.
+    min_covar : float
+        Relative covariance floor (see :func:`fit_regime_hmm`).
+    reject_underfilled_states : bool
+        Reject candidates with any state holding ``< n_short + 1`` Viterbi
+        observations.
+    fallback_to_single_regime : bool
+        Use K=1 when no candidate survives; otherwise raise.
+    overlap_mask : np.ndarray of bool, shape (T,), optional
+        Rows of *X* belonging to the overlap period; used only to report
+        per-state overlap occupancy.
+    seed : int
+        Seed for each candidate's initialisation generator.
+
+    Returns
+    -------
+    HMMSelectionResult
+
+    Raises
+    ------
+    BackcastConvergenceError
+        If no candidate survives and *fallback_to_single_regime* is False, or
+        the K=1 fallback itself is degenerate.
+    """
+    from backcast.exceptions import BackcastConvergenceError
+
     if criterion not in ("bic", "aic"):
         raise ValueError(f"criterion must be 'bic' or 'aic', got {criterion!r}")
     results: dict[int, HMMResult] = {}
     scores: dict[int, float] = {}
     for k in n_regimes_candidates:
-        res = fit_regime_hmm(X, n_regimes=k, **fit_kwargs)
+        res, bic = _fit_hmm_candidate(
+            X, k, n_short, min_covar, max_iter, npr.default_rng(seed),
+            tolerance=tolerance, reject_underfilled_states=reject_underfilled_states,
+        )
+        if res is None:
+            scores[k] = float("inf")
+            continue
         results[k] = res
-        scores[k] = res.bic if criterion == "bic" else res.aic
+        scores[k] = bic if criterion == "bic" else res.aic
         logger.info("HMM K=%d:  log-L=%.1f  BIC=%.1f  AIC=%.1f",
                     k, res.log_likelihood, res.bic, res.aic)
-    best_k = min(scores, key=lambda k: scores[k])
+
+    surviving = [k for k in n_regimes_candidates if k in results]
+    fell_back = False
+    if surviving:
+        best_k = min(surviving, key=lambda k: scores[k])
+    else:
+        if not fallback_to_single_regime:
+            raise BackcastConvergenceError(
+                f"No HMM candidate in {list(n_regimes_candidates)} survived "
+                "degeneracy checks and fallback_to_single_regime is disabled."
+            )
+        logger.warning(
+            "No HMM candidate in %s survived degeneracy checks — falling back "
+            "to K=1 (single-regime / unconditional model).",
+            list(n_regimes_candidates),
+        )
+        res1, bic1 = _fit_hmm_candidate(
+            X, 1, n_short, min_covar, max_iter, npr.default_rng(seed),
+            tolerance=tolerance, reject_underfilled_states=False,
+        )
+        if res1 is None:
+            raise BackcastConvergenceError("K=1 fallback HMM fit is degenerate.")
+        best_k = 1
+        results[1] = res1
+        scores[1] = bic1 if criterion == "bic" else res1.aic
+        fell_back = True
+
+    best = results[best_k]
+    occupancy = np.bincount(best.regime_labels, minlength=best_k)
+    overlap_occ: Optional[np.ndarray] = None
+    if overlap_mask is not None:
+        overlap_mask = np.asarray(overlap_mask, dtype=bool)
+        if overlap_mask.shape != best.regime_labels.shape:
+            raise ValueError(
+                f"overlap_mask shape {overlap_mask.shape} != labels shape "
+                f"{best.regime_labels.shape}"
+            )
+        overlap_occ = np.bincount(best.regime_labels[overlap_mask], minlength=best_k)
+    logger.info(
+        "HMM selected K=%d (surviving %s); state occupancy %s; overlap occupancy %s",
+        best_k, surviving, occupancy.tolist(),
+        None if overlap_occ is None else overlap_occ.tolist(),
+    )
     return HMMSelectionResult(
         candidates=list(n_regimes_candidates),
         results=results,
         best_n_regimes=best_k,
-        best=results[best_k],
+        best=best,
         criterion=criterion,
         scores=scores,
+        surviving_candidates=surviving,
+        state_occupancy=occupancy,
+        overlap_occupancy=overlap_occ,
+        fell_back_to_single_regime=fell_back,
     )
 
 
@@ -395,9 +640,21 @@ def compute_regime_params(
     returns: pd.DataFrame,
     regime_labels: np.ndarray,
     *,
-    min_obs_per_regime: int = 30,
+    short_assets: Optional[list[str]] = None,
+    regimes: Optional[list[int]] = None,
+    reliable_threshold: Optional[int] = None,
+    shrinkage: "str | float | None" = "auto",
+    fallback_to_pooled: bool = True,
+    psd_epsilon: float = 1e-10,
+    min_obs_per_regime: Optional[int] = None,
 ) -> dict:
-    """Per-regime ``(mu, sigma)`` from fully-observed rows.
+    """Per-regime ``(mu, sigma)`` in the legacy dict format.
+
+    Thin wrapper over
+    :func:`backcast.imputation.regime_params.build_regime_params`; thin
+    regimes are shrunk or pooled rather than dropped, so every regime gets
+    usable parameters.  New code should call ``build_regime_params``
+    directly.
 
     Parameters
     ----------
@@ -405,40 +662,42 @@ def compute_regime_params(
         The *overlap* matrix (rows where every column is observed).
     regime_labels : np.ndarray, shape (T,)
         Regime label for each row of ``returns``.
-    min_obs_per_regime : int
-        Regimes with fewer than this many observed rows are dropped — their
-        μ/Σ aren't estimable reliably.
+    short_assets : list[str], optional
+        Short-history columns.  ``None`` treats every column as short, i.e. a
+        regime needs ``n_k > N`` rows to avoid pooling.
+    regimes : list[int], optional
+        All regimes needing parameters (default: those in *regime_labels*).
+    reliable_threshold, shrinkage, fallback_to_pooled, psd_epsilon
+        See ``build_regime_params``.
+    min_obs_per_regime : int, optional
+        DEPRECATED.  Mapped to *reliable_threshold* with a warning.
 
     Returns
     -------
     dict[int, dict]
-        Keys are regime indices; values are ``{'mu': np.ndarray (N,),
-        'sigma': np.ndarray (N, N), 'n_obs': int}``.
+        ``{'mu': (N,), 'sigma': (N, N), 'n_obs': int, 'source': str}`` per
+        regime.
     """
-    if len(regime_labels) != len(returns):
-        raise ValueError(
-            f"regime_labels length {len(regime_labels)} != returns rows {len(returns)}"
+    from backcast.imputation.regime_params import build_regime_params
+
+    if min_obs_per_regime is not None:
+        logger.warning(
+            "DEPRECATION: min_obs_per_regime is no longer a hard cutoff; "
+            "mapping it to reliable_threshold=%d.", min_obs_per_regime,
         )
-    if returns.isna().any().any():
-        raise ValueError("returns must be fully observed to estimate regime params")
-    R = returns.to_numpy(dtype=np.float64)
-    out: dict[int, dict] = {}
-    for k in np.unique(regime_labels):
-        mask = regime_labels == k
-        n_k = int(mask.sum())
-        if n_k < min_obs_per_regime:
-            logger.warning(
-                "Regime %d has only %d observed rows — skipping (need %d).",
-                k, n_k, min_obs_per_regime,
-            )
-            continue
-        block = R[mask]
-        out[int(k)] = {
-            "mu": block.mean(axis=0),
-            "sigma": np.cov(block, rowvar=False, bias=False),
-            "n_obs": n_k,
-        }
-    return out
+        if reliable_threshold is None:
+            reliable_threshold = int(min_obs_per_regime)
+    params = build_regime_params(
+        returns, regime_labels,
+        list(returns.columns) if short_assets is None else short_assets,
+        regimes=regimes, reliable_threshold=reliable_threshold,
+        shrinkage=shrinkage, fallback_to_pooled=fallback_to_pooled,
+        psd_epsilon=psd_epsilon,
+    )
+    return {
+        k: {"mu": p.mu, "sigma": p.sigma, "n_obs": p.n_obs, "source": p.source}
+        for k, p in params.items()
+    }
 
 
 def regime_conditional_impute(
@@ -448,41 +707,28 @@ def regime_conditional_impute(
 ) -> pd.DataFrame:
     """Fill each NaN cell with the **regime-conditional** mean.
 
-    For row ``t`` with regime label ``s_t``, missing columns are filled with
-    their conditional expectation given the observed columns under the
-    parameters ``(μ^{(s_t)}, Σ^{(s_t)})``.  Rows whose regime lacks estimated
-    parameters (see *min_obs_per_regime*) are left unfilled.
+    Delegates to
+    :func:`backcast.imputation.single_impute.regime_single_impute`.
 
     Parameters
     ----------
     returns : pd.DataFrame
         Returns matrix with NaN for missing entries.
     regime_labels : np.ndarray, shape (T,)
-    regime_params : dict[int, {'mu': ..., 'sigma': ...}]
-        From :func:`compute_regime_params`.
+    regime_params : dict[int, RegimeParams or dict]
 
     Returns
     -------
     pd.DataFrame
-        Filled returns — same index/columns as input.  Any row whose regime
-        has no params will retain its NaNs.
+        Filled returns — same index/columns as input, no NaNs.
 
     Raises
     ------
     ValueError
         If *regime_labels* length does not match *returns* rows.
+    BackcastDataError
+        If a row needing imputation has a regime without parameters.
     """
-    if len(regime_labels) != len(returns):
-        raise ValueError(
-            f"regime_labels length {len(regime_labels)} != returns rows {len(returns)}"
-        )
-    from backcast.imputation.single_impute import _fill_rows_conditional
-    R = returns.to_numpy(dtype=np.float64, copy=True)
-    for k, params in regime_params.items():
-        mask = regime_labels == k
-        if not mask.any():
-            continue
-        R_k = R[mask]
-        _fill_rows_conditional(R_k, params["mu"], params["sigma"])
-        R[mask] = R_k
-    return pd.DataFrame(R, index=returns.index, columns=returns.columns)
+    from backcast.imputation.single_impute import regime_single_impute
+
+    return regime_single_impute(returns, regime_labels, regime_params)

@@ -31,6 +31,12 @@ import pandas as pd
 from scipy.linalg import cho_factor, cho_solve
 
 from backcast.data.loader import BackcastDataset
+from backcast.imputation.regime_params import (
+    RegimeSourceSummary,
+    as_regime_params,
+    check_regime_coverage,
+    summarize_regime_sources,
+)
 from backcast.models.em_stambaugh import EMResult
 
 logger = logging.getLogger(__name__)
@@ -57,6 +63,10 @@ class MultipleImputationResult:
     conditional_cov : dict | None
         Per-pattern ``Σ_{M|O}`` actually used for drawing — useful for
         diagnostics.
+    regime_sources : RegimeSourceSummary | None
+        Regime-conditional only: which parameter tier (``full`` / ``shrunk``
+        / ``pooled``) filled each imputed cell, plus the per-asset,
+        per-source breakdown of imputed dates.
     """
 
     imputations: list
@@ -65,6 +75,7 @@ class MultipleImputationResult:
     method: str
     asset_order: list[str]
     conditional_cov: Optional[dict] = None
+    regime_sources: Optional[RegimeSourceSummary] = None
 
 
 @dataclass
@@ -284,9 +295,11 @@ def multiple_impute_regime(
     dataset : BackcastDataset
     regime_labels : np.ndarray, shape (T,)
         Regime label for every row of ``dataset.returns_full``.
-    regime_params : dict[int, {'mu': ..., 'sigma': ...}]
-        Per-regime parameters (from
-        :func:`backcast.models.regime_hmm.compute_regime_params`).
+    regime_params : dict[int, RegimeParams]
+        Per-regime parameters from
+        :func:`backcast.imputation.regime_params.build_regime_params` (legacy
+        ``{'mu', 'sigma'}`` dicts are accepted).  Must cover every regime
+        labelling a row with missing entries.
     n_imputations : int
     seed : int
 
@@ -298,6 +311,8 @@ def multiple_impute_regime(
     ------
     ValueError
         If *regime_labels* length does not match ``dataset.returns_full``.
+    BackcastDataError
+        If a row needing imputation has a regime without parameters.
     """
     if len(regime_labels) != len(dataset.returns_full):
         raise ValueError(
@@ -305,14 +320,18 @@ def multiple_impute_regime(
             f"dataset rows {len(dataset.returns_full)}"
         )
 
+    regime_labels = np.asarray(regime_labels)
     R = dataset.returns_full.to_numpy(dtype=np.float64)
     index = dataset.returns_full.index
     columns = list(dataset.returns_full.columns)
     rng = npr.default_rng(seed)
+    check_regime_coverage(R, regime_labels, regime_params)
+    sources = summarize_regime_sources(dataset.returns_full, regime_labels, regime_params)
 
     # Build per-regime, per-pattern conditional params
     regime_cond: dict[int, dict] = {}
-    for k, params in regime_params.items():
+    for k, raw_params in regime_params.items():
+        params = as_regime_params(raw_params)
         sub_rows = np.where(regime_labels == k)[0]
         if len(sub_rows) == 0:
             continue
@@ -322,7 +341,7 @@ def multiple_impute_regime(
         # Remap local row indices to global
         for patt, local_rows in patterns_k.items():
             patterns_k[patt] = sub_rows[local_rows]
-        regime_cond[k] = _precompute_conditional(params["mu"], params["sigma"], patterns_k)
+        regime_cond[k] = _precompute_conditional(params.mu, params.sigma, patterns_k)
 
     imputations: list[pd.DataFrame] = []
     for _m in range(n_imputations):
@@ -354,6 +373,7 @@ def multiple_impute_regime(
         seed=seed,
         method="regime_conditional",
         asset_order=columns,
+        regime_sources=sources,
     )
 
 

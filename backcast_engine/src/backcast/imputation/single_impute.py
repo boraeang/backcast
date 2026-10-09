@@ -9,13 +9,19 @@ observed/missing pattern receives its own conditional mean formula.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import pandas as pd
 from scipy.linalg import cho_factor, cho_solve
 
 from backcast.data.loader import BackcastDataset
+from backcast.imputation.regime_params import (
+    RegimeSourceSummary,
+    as_regime_params,
+    check_regime_coverage,
+    summarize_regime_sources,
+)
 from backcast.models.em_stambaugh import EMResult
 
 logger = logging.getLogger(__name__)
@@ -151,3 +157,63 @@ def single_impute(
         index=dataset.returns_full.index,
         columns=dataset.returns_full.columns,
     )
+
+
+def regime_single_impute(
+    returns: pd.DataFrame,
+    regime_labels: np.ndarray,
+    regime_params: dict,
+    *,
+    return_sources: bool = False,
+) -> Union[pd.DataFrame, tuple[pd.DataFrame, RegimeSourceSummary]]:
+    """Fill each NaN with its **regime-conditional** mean.
+
+    For row ``t`` with regime ``s_t = k``, missing columns are filled with
+    ``E[R_M | R_O, μ_k, Σ_k]`` using ``regime_params[k]``.
+
+    Parameters
+    ----------
+    returns : pd.DataFrame, shape (T, N)
+        Returns matrix with NaN for missing entries.
+    regime_labels : np.ndarray, shape (T,)
+        Regime label of every row.
+    regime_params : dict[int, RegimeParams]
+        From :func:`backcast.imputation.regime_params.build_regime_params`
+        (legacy ``{'mu', 'sigma'}`` dicts are accepted).
+    return_sources : bool
+        Also return the per-cell ``full``/``shrunk``/``pooled`` tagging.
+
+    Returns
+    -------
+    pd.DataFrame or tuple[pd.DataFrame, RegimeSourceSummary]
+        Same index/columns as *returns*, no NaNs; plus the source summary
+        when *return_sources* is True.  The per-asset source breakdown is
+        logged at INFO either way.
+
+    Raises
+    ------
+    ValueError
+        If *regime_labels* length does not match *returns* rows.
+    BackcastDataError
+        If a row needing imputation has a regime without parameters.
+    """
+    regime_labels = np.asarray(regime_labels)
+    if len(regime_labels) != len(returns):
+        raise ValueError(
+            f"regime_labels length {len(regime_labels)} != returns rows {len(returns)}"
+        )
+    R = returns.to_numpy(dtype=np.float64, copy=True)
+    check_regime_coverage(R, regime_labels, regime_params)
+    sources = summarize_regime_sources(returns, regime_labels, regime_params)
+    for k, params in regime_params.items():
+        mask = regime_labels == k
+        if not mask.any():
+            continue
+        p = as_regime_params(params)
+        R_k = R[mask]
+        _fill_rows_conditional(R_k, p.mu, p.sigma)
+        R[mask] = R_k
+    if np.isnan(R).any():
+        raise RuntimeError("regime_single_impute left NaN values — this is a bug")
+    filled = pd.DataFrame(R, index=returns.index, columns=returns.columns)
+    return (filled, sources) if return_sources else filled

@@ -10,6 +10,7 @@ from backcast.visualization.plots import (
     plot_missingness,
     plot_pit_histogram,
     plot_regime_timeline,
+    plot_source_timeline,
     plot_uncertainty_ellipses,
 )
 
@@ -24,5 +25,6 @@ __all__ = [
     "plot_missingness",
     "plot_pit_histogram",
     "plot_regime_timeline",
+    "plot_source_timeline",
     "plot_uncertainty_ellipses",
 ]

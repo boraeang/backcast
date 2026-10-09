@@ -15,6 +15,7 @@ Loads a YAML config (or accepts a dict), then threads the following steps:
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from dataclasses import dataclass, field, asdict
@@ -39,12 +40,13 @@ from backcast.imputation.multiple_impute import (
     MultipleImputationResult, multiple_impute, multiple_impute_regime,
     prediction_intervals,
 )
+from backcast.imputation.regime_params import build_regime_params
 from backcast.imputation.single_impute import single_impute
 from backcast.models.em_stambaugh import EMResult, em_stambaugh
 from backcast.models.kalman_tvp import KalmanMultiAssetResult, fit_kalman_all
 from backcast.models.model_selector import ModelSelectionResult, select_model_cv
 from backcast.models.regime_hmm import (
-    HMMResult, HMMSelectionResult, compute_regime_params, fit_and_select_hmm,
+    HMMResult, HMMSelectionResult, fit_and_select_hmm,
 )
 from backcast.validation.holdout import HoldoutReport, run_holdout_validation
 
@@ -99,6 +101,80 @@ def _load_yaml(path: str | Path) -> dict:
         return yaml.safe_load(fh)
 
 
+def normalize_config(config: dict) -> dict:
+    """Apply backward-compat shims and validate regime-related settings.
+
+    * ``imputation.min_obs_per_regime`` (removed hard gate) → logged as a
+      DEPRECATION warning and mapped to ``imputation.regime_reliable_threshold``
+      unless that key is already set.
+    * ``imputation.regime_shrinkage`` must be ``"auto"``, ``"heuristic"``,
+      ``null`` or a float in ``[0, 1]``.
+    * ``imputation.regime_reliable_threshold`` must be ``null`` or a positive
+      integer; ``psd_epsilon`` and ``hmm.min_covar`` must be positive.
+
+    Parameters
+    ----------
+    config : dict
+        Parsed config; not modified.
+
+    Returns
+    -------
+    dict
+        A deep copy with the shims applied.
+
+    Raises
+    ------
+    ValueError
+        On an invalid regime/HMM setting.
+    """
+    cfg = copy.deepcopy(config) if config else {}
+    icfg = cfg.get("imputation") or {}
+    if "min_obs_per_regime" in icfg:
+        legacy = icfg.pop("min_obs_per_regime")
+        current = icfg.get("regime_reliable_threshold")
+        if current is None and legacy is not None:
+            icfg["regime_reliable_threshold"] = int(legacy)
+            logger.warning(
+                "DEPRECATION: imputation.min_obs_per_regime is no longer a hard "
+                "cutoff (thin regimes are now shrunk or pooled, never dropped); "
+                "mapped to imputation.regime_reliable_threshold=%d. Rename the "
+                "key in your config.", int(legacy),
+            )
+        else:
+            logger.warning(
+                "DEPRECATION: imputation.min_obs_per_regime=%s ignored because "
+                "imputation.regime_reliable_threshold=%s is set. Remove the "
+                "legacy key from your config.", legacy, current,
+            )
+    if icfg:
+        cfg["imputation"] = icfg
+
+    threshold = icfg.get("regime_reliable_threshold")
+    if threshold is not None and (
+        isinstance(threshold, bool) or int(threshold) != threshold or threshold <= 0
+    ):
+        raise ValueError(
+            f"imputation.regime_reliable_threshold must be null or a positive "
+            f"integer, got {threshold!r}"
+        )
+    shrink = icfg.get("regime_shrinkage", "auto")
+    if isinstance(shrink, str):
+        if shrink not in ("auto", "heuristic"):
+            raise ValueError(
+                f"imputation.regime_shrinkage must be 'auto', 'heuristic', null "
+                f"or a float in [0, 1], got {shrink!r}"
+            )
+    elif shrink is not None and (isinstance(shrink, bool) or not 0.0 <= float(shrink) <= 1.0):
+        raise ValueError(
+            f"imputation.regime_shrinkage must lie in [0, 1], got {shrink!r}"
+        )
+    for section, key in (("imputation", "psd_epsilon"), ("hmm", "min_covar")):
+        value = (cfg.get(section) or {}).get(key)
+        if value is not None and float(value) <= 0:
+            raise ValueError(f"{section}.{key} must be positive, got {value!r}")
+    return cfg
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -134,9 +210,10 @@ class BackcastPipeline:
             format="%(levelname)s %(name)s: %(message)s",
         )
         if config_dict is not None:
-            self.config = dict(config_dict)
+            raw = config_dict
         else:
-            self.config = _load_yaml(config_path or _DEFAULT_CONFIG_PATH)
+            raw = _load_yaml(config_path or _DEFAULT_CONFIG_PATH)
+        self.config = normalize_config(raw)
         self.seed = int(self.config.get("random_seed", 42))
         self.rng = np.random.default_rng(self.seed)
         logger.info("Pipeline initialised with seed=%d", self.seed)
@@ -199,12 +276,20 @@ class BackcastPipeline:
         # HMM (on long assets)
         hcfg = self.config.get("hmm", {})
         try:
+            n_total = len(dataset.returns_full)
+            overlap_mask = np.zeros(n_total, dtype=bool)
+            overlap_mask[n_total - dataset.overlap_length:] = True
             sel = fit_and_select_hmm(
                 dataset.returns_full[dataset.long_assets],
                 n_regimes_candidates=tuple(hcfg.get("n_regimes_candidates", (2, 3, 4))),
                 criterion=hcfg.get("selection_criterion", "bic"),
+                n_short=len(dataset.short_assets),
                 max_iter=int(hcfg.get("max_iterations", 200)),
                 tolerance=float(hcfg.get("tolerance", 1e-4)),
+                min_covar=float(hcfg.get("min_covar", 1e-3)),
+                reject_underfilled_states=bool(hcfg.get("reject_underfilled_states", True)),
+                fallback_to_single_regime=bool(hcfg.get("fallback_to_single_regime", True)),
+                overlap_mask=overlap_mask,
                 seed=self.seed,
             )
             out["hmm_selection"] = sel
@@ -295,7 +380,14 @@ class BackcastPipeline:
                                "falling back to unconditional_em")
                 return multiple_impute(dataset, em, n_imputations=n_imp, seed=self.seed)
             overlap_labels = hmm.regime_labels[-dataset.overlap_length:]
-            regime_params = compute_regime_params(dataset.overlap_matrix, overlap_labels)
+            regime_params = build_regime_params(
+                dataset.overlap_matrix, overlap_labels, dataset.short_assets,
+                regimes=np.unique(hmm.regime_labels),
+                reliable_threshold=icfg.get("regime_reliable_threshold"),
+                shrinkage=icfg.get("regime_shrinkage", "auto"),
+                fallback_to_pooled=bool(icfg.get("regime_fallback_to_pooled", True)),
+                psd_epsilon=float(icfg.get("psd_epsilon", 1e-10)),
+            )
             return multiple_impute_regime(
                 dataset, hmm.regime_labels, regime_params,
                 n_imputations=n_imp, seed=self.seed,
@@ -420,7 +512,7 @@ class BackcastPipeline:
             plot_backcast_fan, plot_backtest_fan, plot_correlation_comparison,
             plot_eigenvalue_spectrum, plot_em_convergence, plot_holdout_scatter,
             plot_kalman_betas, plot_missingness, plot_regime_timeline,
-            plot_uncertainty_ellipses,
+            plot_source_timeline, plot_uncertainty_ellipses,
         )
         import matplotlib.pyplot as plt
 
@@ -464,6 +556,9 @@ class BackcastPipeline:
         ), "10_uncertainty_ellipse")
         for name, bt in results.downstream.backtests.items():
             _save(plot_backtest_fan(bt), f"11_backtest_{name}")
+        if results.imputation.regime_sources is not None:
+            _save(plot_source_timeline(results.imputation.regime_sources),
+                  "12_imputation_source")
 
         # --- summary JSON ---
         summary_path = out / "summary.json"
@@ -531,7 +626,17 @@ def _build_summary(results: FullResults) -> dict:
             "candidates": list(results.hmm_selection.candidates),
             "best_n_regimes": results.hmm_selection.best_n_regimes,
             "criterion": results.hmm_selection.criterion,
-            "scores": {int(k): float(v) for k, v in results.hmm_selection.scores.items()},
+            "scores": {
+                int(k): (float(v) if np.isfinite(v) else None)
+                for k, v in results.hmm_selection.scores.items()
+            },
+            "surviving_candidates": list(results.hmm_selection.surviving_candidates),
+            "state_occupancy": results.hmm_selection.state_occupancy.tolist(),
+            "overlap_occupancy": (
+                None if results.hmm_selection.overlap_occupancy is None
+                else results.hmm_selection.overlap_occupancy.tolist()
+            ),
+            "fell_back_to_single_regime": results.hmm_selection.fell_back_to_single_regime,
         }
     ho_out = {
         "overall_coverage": results.holdout.overall_coverage,
@@ -596,6 +701,13 @@ def _build_summary(results: FullResults) -> dict:
             "n_imputations": mi.n_imputations,
             "method": mi.method,
             "seed": mi.seed,
+            "source_breakdown": (
+                None if mi.regime_sources is None
+                else {
+                    asset: {src: int(n) for src, n in row.items()}
+                    for asset, row in mi.regime_sources.breakdown.iterrows()
+                }
+            ),
         },
         "model_selection": model_sel_out,
         "downstream": {

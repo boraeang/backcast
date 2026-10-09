@@ -17,6 +17,9 @@ Implements the 11 plots named in the spec:
 9. :func:`plot_eigenvalue_spectrum`
 10. :func:`plot_uncertainty_ellipses`
 11. :func:`plot_backtest_fan`
+
+plus :func:`plot_source_timeline` (regime-parameter source of each imputed
+cell: ``full`` / ``shrunk`` / ``pooled``).
 """
 from __future__ import annotations
 
@@ -402,5 +405,80 @@ def plot_backtest_fan(backtest_result, *, figsize=(12, 5)) -> Figure:
     )
     ax.grid(alpha=0.3)
     ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# 12. Imputation source timeline
+# ---------------------------------------------------------------------------
+
+SOURCE_COLORS: dict[str, str] = {
+    "observed": "#e6e6e6",
+    "full": "#2e7d32",
+    "shrunk": "#f9a825",
+    "pooled": "#c62828",
+}
+
+
+def plot_source_timeline(source_summary, *, figsize=(12, None)) -> Figure:
+    """Backcast timeline coloured by regime-parameter source, one row per asset.
+
+    Each imputed cell is coloured by the tier that supplied its parameters
+    (``full`` / ``shrunk`` / ``pooled``); observed cells are light grey.  A
+    large red share flags over-reliance on the unconditional fallback.
+
+    Parameters
+    ----------
+    source_summary : RegimeSourceSummary
+        From ``MultipleImputationResult.regime_sources`` or
+        ``regime_single_impute(..., return_sources=True)``.
+    figsize : tuple
+        Height ``None`` scales with the number of assets.
+
+    Returns
+    -------
+    Figure
+    """
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Patch
+
+    cells = source_summary.cell_source
+    order = ["observed", "full", "shrunk", "pooled"]
+    code_of = {name: i for i, name in enumerate(order)}
+    codes = np.vectorize(lambda v: code_of["observed" if v is None else v], otypes=[int])(
+        cells.to_numpy(dtype=object)
+    ) if cells.size else np.zeros((len(cells), 0), dtype=int)
+
+    n_assets = max(cells.shape[1], 1)
+    width, height = figsize
+    if height is None:
+        height = 1.2 + 0.35 * n_assets
+    fig, ax = plt.subplots(figsize=(width, height))
+    cmap = ListedColormap([SOURCE_COLORS[n] for n in order])
+    ax.imshow(
+        codes.T, aspect="auto", cmap=cmap, vmin=-0.5, vmax=len(order) - 0.5,
+        interpolation="nearest", extent=[0, len(cells), n_assets, 0],
+    )
+    ax.set_yticks(np.arange(cells.shape[1]) + 0.5)
+    ax.set_yticklabels(list(cells.columns))
+    dates = cells.index
+    if len(dates):
+        n_ticks = min(8, len(dates))
+        positions = np.linspace(0, len(dates) - 1, n_ticks, dtype=int)
+        ax.set_xticks(positions)
+        if isinstance(dates, pd.DatetimeIndex):
+            ax.set_xticklabels([dates[p].strftime("%Y-%m") for p in positions], rotation=30)
+
+    totals = source_summary.breakdown.sum(axis=0)
+    n_imputed = int(totals.sum())
+    pooled_pct = 100.0 * totals.get("pooled", 0) / n_imputed if n_imputed else 0.0
+    ax.set_title(f"Imputation parameter source  (pooled: {pooled_pct:.1f}% of imputed cells)")
+    handles = [Patch(color=SOURCE_COLORS["observed"], label="observed")] + [
+        Patch(color=SOURCE_COLORS[s], label=f"{s} ({int(totals.get(s, 0))})")
+        for s in ("full", "shrunk", "pooled")
+    ]
+    ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.01, 1.0),
+              fontsize=8, frameon=False)
     fig.tight_layout()
     return fig
