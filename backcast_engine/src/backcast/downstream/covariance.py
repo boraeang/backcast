@@ -175,17 +175,24 @@ def combined_covariance(imputations: list) -> CovarianceResult:
 # Ledoit-Wolf shrinkage
 # ---------------------------------------------------------------------------
 
-def _ledoit_wolf_alpha(returns: np.ndarray, sigma_hat: np.ndarray) -> tuple[float, np.ndarray]:
-    """Ledoit-Wolf optimal shrinkage intensity toward the constant-variance target.
+def _ledoit_wolf_alpha(
+    returns: np.ndarray,
+    sigma_hat: np.ndarray,
+    target: Optional[np.ndarray] = None,
+) -> tuple[float, np.ndarray]:
+    """Ledoit-Wolf optimal shrinkage intensity toward a target covariance.
 
-    Target = ``(tr Σ̂ / N) · I``.  Returns ``(alpha, target)``.
+    Target defaults to the constant-variance matrix ``(tr Σ̂ / N) · I``; any
+    fixed (data-independent) target such as a pooled covariance may be
+    supplied instead.  Returns ``(alpha, target)``.
     """
     T, N = returns.shape
     mu_t = returns.mean(axis=0)
     X = returns - mu_t
-    # tr(Σ̂) / N
-    target_var = float(np.trace(sigma_hat) / N)
-    target = target_var * np.eye(N)
+    if target is None:
+        # tr(Σ̂) / N
+        target_var = float(np.trace(sigma_hat) / N)
+        target = target_var * np.eye(N)
 
     # π̂ = (1/T) Σ_t ||X_t X_t^T - Σ̂||_F²  (element-wise mean-square-error)
     pi_mat = np.zeros((N, N))

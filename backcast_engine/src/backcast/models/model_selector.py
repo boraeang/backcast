@@ -39,7 +39,8 @@ from scipy.stats import norm
 
 from backcast.data.loader import BackcastDataset
 from backcast.models.em_stambaugh import em_stambaugh
-from backcast.models.regime_hmm import compute_regime_params, fit_regime_hmm
+from backcast.imputation.regime_params import build_regime_params
+from backcast.models.regime_hmm import fit_regime_hmm
 
 logger = logging.getLogger(__name__)
 
@@ -280,7 +281,10 @@ def _cv_regime_conditional(
         train_mask[lo:hi] = False
         train_returns = overlap.iloc[train_mask]
         train_labels = overlap_labels[train_mask]
-        regime_params = compute_regime_params(train_returns, train_labels)
+        regime_params = build_regime_params(
+            train_returns, train_labels, short_names,
+            regimes=np.unique(overlap_labels),
+        )
 
         window_labels = overlap_labels[lo:hi]
         obs_data_all = overlap.iloc[lo:hi][dataset.long_assets].to_numpy()
@@ -289,33 +293,20 @@ def _cv_regime_conditional(
         predicted = np.zeros_like(actual)
         per_row_std = np.zeros_like(actual)
 
-        any_unfitted = False
+        # Every regime gets params (full / shrunk / pooled cascade); count
+        # rows served by the pooled fallback for diagnostics.
+        fallback_rows = 0
         for k, params in regime_params.items():
             mask = (window_labels == k)
             if not mask.any():
                 continue
             alpha_k, beta_k, cond_std_k = _conditional_block(
-                params["mu"], params["sigma"], long_idx, short_idx,
+                params.mu, params.sigma, long_idx, short_idx,
             )
             predicted[mask] = alpha_k + obs_data_all[mask] @ beta_k.T
             per_row_std[mask] = cond_std_k
-
-        # Rows whose regime has no params (e.g., only a handful of points)
-        # fall back to the unconditional pooled estimate
-        unfitted = ~np.isin(window_labels, list(regime_params.keys()))
-        if unfitted.any():
-            any_unfitted = True
-            pooled_mu = train_returns.mean().to_numpy()
-            pooled_sigma = train_returns.cov().to_numpy()
-            alpha_p, beta_p, cond_std_p = _conditional_block(
-                pooled_mu, pooled_sigma, long_idx, short_idx,
-            )
-            predicted[unfitted] = alpha_p + obs_data_all[unfitted] @ beta_p.T
-            per_row_std[unfitted] = cond_std_p
-            logger.debug(
-                "regime-conditional CV: window %d has %d rows with unfitted regime",
-                w, int(unfitted.sum()),
-            )
+            if params.source == "pooled":
+                fallback_rows += int(mask.sum())
 
         lower = predicted - z * per_row_std
         upper = predicted + z * per_row_std
@@ -334,7 +325,7 @@ def _cv_regime_conditional(
             "n_cells": int(covered.size),
             "n_covered": int(covered.sum()),
             "correlation_error": corr_err,
-            "fallback_rows": int(unfitted.sum()) if any_unfitted else 0,
+            "fallback_rows": fallback_rows,
         })
     return _aggregate("regime_conditional", per_window, coverage_level)
 

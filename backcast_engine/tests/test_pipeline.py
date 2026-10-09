@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from backcast.pipeline import BackcastPipeline, FullResults
+from backcast.pipeline import BackcastPipeline, FullResults, normalize_config
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -94,6 +94,25 @@ class TestPipeline:
             assert key in paths
             assert paths[key].exists()
 
+    def test_regime_conditional_exports_source_breakdown(self, tmp_path):
+        csv = _synthetic_csv(tmp_path, seed=3)
+        cfg = {**_TINY_CONFIG,
+               "imputation": {"n_imputations": 5, "method": "regime_conditional"}}
+        pipe = BackcastPipeline(config_dict=cfg, log_level="WARNING")
+        res = pipe.run(csv)
+        assert res.imputation.regime_sources is not None
+        assert all(df.isna().sum().sum() == 0 for df in res.imputation.imputations)
+        out_dir = tmp_path / "artefacts"
+        paths = pipe.export(res, out_dir)
+        assert paths["12_imputation_source"].exists()
+        with open(out_dir / "summary.json") as fh:
+            summary = json.load(fh)
+        bd = summary["imputation"]["source_breakdown"]
+        assert set(bd) == set(res.dataset.short_assets)
+        for asset, counts in bd.items():
+            assert set(counts) == {"full", "shrunk", "pooled"}
+            assert sum(counts.values()) == int(res.dataset.returns_full[asset].isna().sum())
+
     def test_pipeline_from_yaml(self, tmp_path):
         """Pipeline should load the packaged default YAML config if no dict is supplied."""
         pipe = BackcastPipeline(log_level="WARNING")
@@ -147,3 +166,71 @@ class TestPipelineTier2:
         assert summary["hmm"]["n_regimes"] == 2
         # HMM model-selection scores captured
         assert summary["hmm_selection"]["best_n_regimes"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Config normalisation / backward compatibility
+# ---------------------------------------------------------------------------
+
+class TestConfigCompat:
+    def test_default_yaml_has_regime_keys(self):
+        pipe = BackcastPipeline(log_level="WARNING")
+        icfg = pipe.config["imputation"]
+        assert "min_obs_per_regime" not in icfg
+        assert icfg["regime_reliable_threshold"] is None
+        assert icfg["regime_shrinkage"] == "auto"
+        assert icfg["regime_fallback_to_pooled"] is True
+        assert icfg["psd_epsilon"] == pytest.approx(1e-10)
+        hcfg = pipe.config["hmm"]
+        assert hcfg["min_covar"] == pytest.approx(1e-3)
+        assert hcfg["reject_underfilled_states"] is True
+        assert hcfg["fallback_to_single_regime"] is True
+
+    def test_legacy_min_obs_mapped_with_deprecation(self, caplog):
+        raw = {"imputation": {"method": "regime_conditional", "min_obs_per_regime": 15}}
+        with caplog.at_level("WARNING", logger="backcast.pipeline"):
+            pipe = BackcastPipeline(config_dict=raw, log_level="WARNING")
+        icfg = pipe.config["imputation"]
+        assert "min_obs_per_regime" not in icfg
+        assert icfg["regime_reliable_threshold"] == 15
+        assert any("DEPRECATION" in r.message and "min_obs_per_regime" in r.message
+                   for r in caplog.records)
+        # caller's dict is untouched
+        assert raw["imputation"]["min_obs_per_regime"] == 15
+
+    def test_explicit_threshold_wins_over_legacy(self, caplog):
+        raw = {"imputation": {"min_obs_per_regime": 15, "regime_reliable_threshold": 80}}
+        with caplog.at_level("WARNING", logger="backcast.pipeline"):
+            cfg = normalize_config(raw)
+        assert cfg["imputation"]["regime_reliable_threshold"] == 80
+        assert "min_obs_per_regime" not in cfg["imputation"]
+        assert any("ignored" in r.message for r in caplog.records)
+
+    def test_legacy_yaml_file(self, tmp_path, caplog):
+        p = tmp_path / "old.yaml"
+        p.write_text("random_seed: 1\nimputation:\n  method: regime_conditional\n"
+                     "  min_obs_per_regime: 30\n")
+        with caplog.at_level("WARNING", logger="backcast.pipeline"):
+            pipe = BackcastPipeline(p, log_level="WARNING")
+        assert pipe.config["imputation"]["regime_reliable_threshold"] == 30
+        assert any("DEPRECATION" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize("icfg", [
+        {"regime_shrinkage": 1.5},
+        {"regime_shrinkage": "ledoit"},
+        {"regime_reliable_threshold": 0},
+        {"regime_reliable_threshold": 12.5},
+        {"psd_epsilon": 0.0},
+    ])
+    def test_invalid_imputation_settings_rejected(self, icfg):
+        with pytest.raises(ValueError):
+            normalize_config({"imputation": icfg})
+
+    def test_invalid_min_covar_rejected(self):
+        with pytest.raises(ValueError, match="min_covar"):
+            normalize_config({"hmm": {"min_covar": -1e-3}})
+
+    @pytest.mark.parametrize("shrink", ["auto", "heuristic", None, 0.0, 0.3, 1])
+    def test_valid_shrinkage_accepted(self, shrink):
+        cfg = normalize_config({"imputation": {"regime_shrinkage": shrink}})
+        assert cfg["imputation"]["regime_shrinkage"] == shrink
