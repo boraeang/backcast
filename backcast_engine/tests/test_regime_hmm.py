@@ -184,6 +184,28 @@ class TestDegenerateRejection:
         )
         assert model is None and bic == float("inf")
 
+    def test_non_converged_kept_when_toggle_off(self, caplog):
+        X, _, _, _, _ = _simulate_2regime(T=1000, seed=13)
+        with caplog.at_level("WARNING", logger="backcast.models.regime_hmm"):
+            model, bic = _fit_hmm_candidate(
+                X, 2, 1, 1e-3, 2, np.random.default_rng(0), tolerance=1e-12,
+                reject_nonconverged=False,
+            )
+        assert model is not None and not model.converged
+        assert np.isfinite(bic)
+        _assert_finite_model(model)
+        assert any("kept for selection" in r.message for r in caplog.records)
+
+    def test_selection_with_toggle_off_does_not_fall_back(self):
+        X, _, _, _, _ = _simulate_2regime(T=1000, seed=13)
+        strict = fit_and_select_hmm(X, (2, 3), max_iter=2, tolerance=1e-12,
+                                    n_short=1, seed=0)
+        relaxed = fit_and_select_hmm(X, (2, 3), max_iter=2, tolerance=1e-12,
+                                     n_short=1, reject_nonconverged=False, seed=0)
+        assert strict.fell_back_to_single_regime
+        assert not relaxed.fell_back_to_single_regime
+        assert relaxed.surviving_candidates
+
     def test_fallback_to_single_regime(self, caplog):
         X, _, _, _, _ = _simulate_2regime(T=600, seed=14)
         df = pd.DataFrame(X, columns=list("ABC"))
@@ -199,6 +221,13 @@ class TestDegenerateRejection:
         _assert_finite_model(sel.best)
         np.testing.assert_allclose(sel.best.means[0], X.mean(axis=0), atol=1e-10)
         assert any("falling back to K=1" in r.message for r in caplog.records)
+
+    def test_fallback_survives_tiny_max_iter(self):
+        """Regression: K=1 fallback must not itself be rejected as non-converged."""
+        X, _, _, _, _ = _simulate_2regime(T=600, seed=14)
+        sel = fit_and_select_hmm(X, (2,), max_iter=1, n_short=1, seed=0)
+        assert sel.fell_back_to_single_regime and sel.best_n_regimes == 1
+        np.testing.assert_allclose(sel.best.means[0], X.mean(axis=0), atol=1e-10)
 
     def test_fallback_disabled_raises(self):
         X, _, _, _, _ = _simulate_2regime(T=600, seed=14)

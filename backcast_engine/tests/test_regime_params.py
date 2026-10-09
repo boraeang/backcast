@@ -108,6 +108,23 @@ class TestCascade:
         p = build_regime_params(df, labels, SHORT, shrinkage=0.4)[1]
         np.testing.assert_allclose(p.sigma, 0.4 * pooled + 0.6 * raw, rtol=1e-8, atol=1e-14)
 
+    def test_shrink_mean_toggle(self):
+        df = _overlap()
+        labels = _labels(len(df), {0: 570, 1: 30})
+        raw_mu = df.to_numpy()[labels == 1].mean(axis=0)
+        pooled_mu = df.to_numpy().mean(axis=0)
+        on = build_regime_params(df, labels, SHORT, shrinkage=0.4)[1]
+        off = build_regime_params(df, labels, SHORT, shrinkage=0.4, shrink_mean=False)[1]
+        np.testing.assert_allclose(on.mu, 0.4 * pooled_mu + 0.6 * raw_mu, rtol=1e-12)
+        np.testing.assert_allclose(off.mu, raw_mu, rtol=1e-12)
+        np.testing.assert_allclose(on.sigma, off.sigma)       # covariance unaffected
+        # full and pooled tiers are unaffected by the toggle
+        labels2 = _labels(len(df), {0: 600})
+        a = build_regime_params(df, labels2, SHORT, regimes=[0, 1])
+        b = build_regime_params(df, labels2, SHORT, regimes=[0, 1], shrink_mean=False)
+        for k in (0, 1):
+            np.testing.assert_allclose(a[k].mu, b[k].mu)
+
     def test_reliable_threshold_override(self):
         df = _overlap()
         labels = _labels(len(df), {0: 570, 1: 30})

@@ -419,10 +419,18 @@ def fit_regime_hmm(
     )
 
 
-def _degeneracy_reason(res: HMMResult, n_short: int) -> Optional[str]:
+def _degeneracy_reason(
+    res: HMMResult, n_short: int, reject_nonconverged: bool = True,
+) -> Optional[str]:
     """Return why a fitted HMM is unusable, or ``None`` if it is usable."""
     if not res.converged:
-        return f"did not converge in {res.n_iter} iterations"
+        if reject_nonconverged:
+            return f"did not converge in {res.n_iter} iterations"
+        logger.warning(
+            "HMM K=%d did not converge in %d iterations — kept for selection "
+            "(reject_nonconverged=False); its BIC is conservative.",
+            res.n_regimes, res.n_iter,
+        )
     for name, arr in (("means", res.means), ("covariances", res.covariances),
                       ("transition_matrix", res.transition_matrix)):
         if np.isnan(arr).any():
@@ -450,11 +458,13 @@ def _fit_hmm_candidate(
     *,
     tolerance: float = 1e-4,
     reject_underfilled_states: bool = True,
+    reject_nonconverged: bool = True,
 ) -> tuple[Optional[HMMResult], float]:
     """Fit a K-state Gaussian HMM; return ``(model, bic)`` or ``(None, inf)``.
 
-    A candidate is rejected (``(None, inf)``) if the fit raises, does not
-    converge, has NaN/inf parameters or log-likelihood, or — when
+    A candidate is rejected (``(None, inf)``) if the fit raises, has NaN/inf
+    parameters or log-likelihood, does not converge (when
+    *reject_nonconverged*), or — when
     *reject_underfilled_states* — any Viterbi state has fewer than
     ``n_short + 1`` observations (its covariance on the short-asset block
     would not be estimable).
@@ -477,6 +487,10 @@ def _fit_hmm_candidate(
         Log-likelihood convergence threshold.
     reject_underfilled_states : bool
         Apply the ``n_short + 1`` occupancy check.
+    reject_nonconverged : bool
+        Reject fits that hit *n_iter* without converging.  When False they
+        compete on BIC (with a WARNING); since their likelihood is not yet
+        maximised, their BIC is conservative.
 
     Returns
     -------
@@ -492,7 +506,9 @@ def _fit_hmm_candidate(
         logger.warning("HMM K=%d rejected: fit raised %s: %s",
                        k, type(exc).__name__, exc)
         return None, float("inf")
-    reason = _degeneracy_reason(res, n_short if reject_underfilled_states else -1)
+    reason = _degeneracy_reason(
+        res, n_short if reject_underfilled_states else -1, reject_nonconverged,
+    )
     if reason is not None:
         logger.warning("HMM K=%d rejected: %s", k, reason)
         return None, float("inf")
@@ -509,6 +525,7 @@ def fit_and_select_hmm(
     tolerance: float = 1e-4,
     min_covar: float = 1e-3,
     reject_underfilled_states: bool = True,
+    reject_nonconverged: bool = True,
     fallback_to_single_regime: bool = True,
     overlap_mask: Optional[np.ndarray] = None,
     seed: int = 0,
@@ -539,6 +556,8 @@ def fit_and_select_hmm(
     reject_underfilled_states : bool
         Reject candidates with any state holding ``< n_short + 1`` Viterbi
         observations.
+    reject_nonconverged : bool
+        Reject candidates that hit *max_iter* without converging.
     fallback_to_single_regime : bool
         Use K=1 when no candidate survives; otherwise raise.
     overlap_mask : np.ndarray of bool, shape (T,), optional
@@ -567,6 +586,7 @@ def fit_and_select_hmm(
         res, bic = _fit_hmm_candidate(
             X, k, n_short, min_covar, max_iter, npr.default_rng(seed),
             tolerance=tolerance, reject_underfilled_states=reject_underfilled_states,
+            reject_nonconverged=reject_nonconverged,
         )
         if res is None:
             scores[k] = float("inf")
@@ -591,9 +611,12 @@ def fit_and_select_hmm(
             "to K=1 (single-regime / unconditional model).",
             list(n_regimes_candidates),
         )
+        # K=1 is closed-form (sample mean / covariance) after one M-step, so
+        # the convergence flag is irrelevant; only NaN/inf can disqualify it.
         res1, bic1 = _fit_hmm_candidate(
-            X, 1, n_short, min_covar, max_iter, npr.default_rng(seed),
+            X, 1, n_short, min_covar, max(max_iter, 3), npr.default_rng(seed),
             tolerance=tolerance, reject_underfilled_states=False,
+            reject_nonconverged=False,
         )
         if res1 is None:
             raise BackcastConvergenceError("K=1 fallback HMM fit is degenerate.")
@@ -646,6 +669,7 @@ def compute_regime_params(
     shrinkage: "str | float | None" = "auto",
     fallback_to_pooled: bool = True,
     psd_epsilon: float = 1e-10,
+    shrink_mean: bool = True,
     min_obs_per_regime: Optional[int] = None,
 ) -> dict:
     """Per-regime ``(mu, sigma)`` in the legacy dict format.
@@ -667,7 +691,7 @@ def compute_regime_params(
         regime needs ``n_k > N`` rows to avoid pooling.
     regimes : list[int], optional
         All regimes needing parameters (default: those in *regime_labels*).
-    reliable_threshold, shrinkage, fallback_to_pooled, psd_epsilon
+    reliable_threshold, shrinkage, fallback_to_pooled, psd_epsilon, shrink_mean
         See ``build_regime_params``.
     min_obs_per_regime : int, optional
         DEPRECATED.  Mapped to *reliable_threshold* with a warning.
@@ -692,7 +716,7 @@ def compute_regime_params(
         list(returns.columns) if short_assets is None else short_assets,
         regimes=regimes, reliable_threshold=reliable_threshold,
         shrinkage=shrinkage, fallback_to_pooled=fallback_to_pooled,
-        psd_epsilon=psd_epsilon,
+        psd_epsilon=psd_epsilon, shrink_mean=shrink_mean,
     )
     return {
         k: {"mu": p.mu, "sigma": p.sigma, "n_obs": p.n_obs, "source": p.source}
